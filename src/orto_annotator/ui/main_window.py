@@ -29,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.8 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.5 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -50,7 +50,6 @@ class MainWindow(QMainWindow):
         self._stroke_id = 0
         self._display_mesh: pv.PolyData | None = None
         self._display_rgb: np.ndarray | None = None
-        self._display_blocks: list[tuple[int, int, pv.PolyData, object, np.ndarray]] = []
         self._last_painted_cell = -1
         self._last_world_position: np.ndarray | None = None
         self._last_world_normal: np.ndarray | None = None
@@ -386,62 +385,36 @@ class MainWindow(QMainWindow):
         self._cell_locator.SetDataSet(self._display_mesh)
         self._cell_locator.BuildLocator()
         self._picker.AddLocator(self._cell_locator)
-        # Independent cell batches let a stroke update only touched VTK buffers.
-        self._display_blocks = []
-        self._display_rgb = None
-        self._mesh_actor = None
-        block_size = 25000
-        face_count = self.source.face_count
-        for start in range(0, face_count, block_size):
-            end = min(start + block_size, face_count)
-            # Build a PolyData batch directly from the corresponding source
-            # triangles. This avoids relying on VTK extraction classes whose
-            # Python module exports differ between bundled VTK versions.
-            source_faces = np.asarray(self._display_mesh.faces, dtype=np.int64).reshape(-1, 4)
-            block_faces = source_faces[start:end].reshape(-1)
-            block_mesh = pv.PolyData(
-                np.asarray(self._display_mesh.points),
-                faces=block_faces,
-            )
-            point_normals = self._display_mesh.point_data.get("Normals")
-            if point_normals is not None:
-                block_mesh.point_data["Normals"] = np.asarray(point_normals)
-                block_mesh.GetPointData().SetActiveNormals("Normals")
-            block_rgb = np.asarray(
-                [
-                    tuple(round(channel * 255) for channel in LABEL_COLORS[Label(int(value))])
-                    for value in self.labels[start:end]
-                ],
-                dtype=np.uint8,
-            )
-            if block_mesh.n_cells != end - start:
-                raise RuntimeError("Не удалось сохранить соответствие граней в блоке отображения.")
-            block_mesh.cell_data["rgb"] = block_rgb
-            actor = self.plotter.add_mesh(
-                block_mesh,
-                scalars="rgb",
-                rgb=True,
-                lighting=True,
-                smooth_shading=True,
-                show_edges=False,
-                ambient=0.12,
-                diffuse=0.88,
-                specular=0.45,
-                specular_power=32,
-                name="source_mesh_" + str(start),
-            )
-            prop = actor.GetProperty()
-            prop.SetLighting(True)
-            prop.SetInterpolationToPhong()
-            prop.SetAmbient(0.12)
-            prop.SetDiffuse(0.88)
-            prop.SetSpecular(0.45)
-            prop.SetSpecularPower(32)
-            prop.SetColor(0.82, 0.84, 0.88)
-            prop.SetBackfaceCulling(False)
-            self._display_blocks.append((start, end, block_mesh, actor, block_rgb))
-            if self._mesh_actor is None:
-                self._mesh_actor = actor
+        self._display_rgb = np.asarray(
+            [
+                tuple(round(channel * 255) for channel in LABEL_COLORS[Label(int(value))])
+                for value in self.labels
+            ],
+            dtype=np.uint8,
+        )
+        self._display_mesh.cell_data["rgb"] = self._display_rgb
+        self._mesh_actor = self.plotter.add_mesh(
+            self._display_mesh,
+            scalars="rgb",
+            rgb=True,
+            lighting=True,
+            smooth_shading=True,
+            show_edges=False,
+            ambient=0.12,
+            diffuse=0.88,
+            specular=0.45,
+            specular_power=32,
+            name="source_mesh",
+        )
+        prop = self._mesh_actor.GetProperty()
+        prop.SetLighting(True)
+        prop.SetInterpolationToPhong()
+        prop.SetAmbient(0.12)
+        prop.SetDiffuse(0.88)
+        prop.SetSpecular(0.45)
+        prop.SetSpecularPower(32)
+        prop.SetColor(0.82, 0.84, 0.88)
+        prop.SetBackfaceCulling(False)
         renderer = self.plotter.renderer
         renderer.RemoveAllLights()
         key_light = pv._vtk.vtkLight()
@@ -459,7 +432,7 @@ class MainWindow(QMainWindow):
         if (
             self.source is None
             or self._display_mesh is None
-            or not self._display_blocks
+            or self._display_rgb is None
         ):
             return
         affected = np.atleast_1d(np.asarray(cell_ids, dtype=np.intp))
@@ -483,21 +456,11 @@ class MainWindow(QMainWindow):
             tuple(round(channel * 255) for channel in LABEL_COLORS[self.active_label]),
             dtype=np.uint8,
         )
-        # Source cell IDs remain global; only touched contiguous display batches
-        # receive array writes and Modified notifications.
-        first_block = int(changed.min()) // 25000
-        last_block = int(changed.max()) // 25000
-        for block_index in range(first_block, last_block + 1):
-            start, end, block_mesh, _actor, block_rgb = self._display_blocks[block_index]
-            local_mask = (changed >= start) & (changed < end)
-            if not np.any(local_mask):
-                continue
-            local_ids = changed[local_mask] - start
-            block_rgb[local_ids] = color
-            vtk_colors = block_mesh.GetCellData().GetArray("rgb")
-            if vtk_colors is not None:
-                vtk_colors.Modified()
-            block_mesh.Modified()
+        self._display_rgb[changed] = color
+        vtk_colors = self._display_mesh.GetCellData().GetArray("rgb")
+        if vtk_colors is not None:
+            vtk_colors.Modified()
+        self._display_mesh.Modified()
         if not self._paint_render_pending:
             self._paint_render_pending = True
             QTimer.singleShot(16, self._flush_paint_render)
