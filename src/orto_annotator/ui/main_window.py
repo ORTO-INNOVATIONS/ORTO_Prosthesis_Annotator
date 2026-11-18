@@ -29,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.2 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.3 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -39,8 +39,10 @@ class MainWindow(QMainWindow):
         self._left_button_down = False
         self._picker = pv._vtk.vtkCellPicker()
         self._picker.SetTolerance(0.0005)
+        self._cell_locator = None
         self._paint_render_pending = False
         self._last_pick_position: tuple[int, int] | None = None
+        self._stroke_seen: set[int] = set()
         self._cell_tree: cKDTree | None = None
         self._display_mesh: pv.PolyData | None = None
         self._display_rgb: np.ndarray | None = None
@@ -118,6 +120,7 @@ class MainWindow(QMainWindow):
             self._left_button_down = True
             self._last_painted_cell = -1
             self._last_pick_position = None
+            self._stroke_seen.clear()
             self._paint_from_mouse_event(event)
             return True
 
@@ -132,6 +135,7 @@ class MainWindow(QMainWindow):
             self._left_button_down = False
             self._last_painted_cell = -1
             self._last_pick_position = None
+            self._stroke_seen.clear()
             self._update_info()
             return True
 
@@ -146,7 +150,7 @@ class MainWindow(QMainWindow):
         if self._last_pick_position is not None:
             dx = x - self._last_pick_position[0]
             dy = y - self._last_pick_position[1]
-            if dx * dx + dy * dy < 9:
+            if dx * dx + dy * dy < 64:
                 return
         self._last_pick_position = current
         if self._picker.Pick(x, y, 0, self.plotter.renderer):
@@ -169,6 +173,7 @@ class MainWindow(QMainWindow):
         self._left_button_down = False
         self._last_painted_cell = -1
         self._last_pick_position = None
+        self._stroke_seen.clear()
         if enabled:
             # Base VTK style has no camera gestures; Qt events are handled by eventFilter.
             self.plotter.interactor.SetInteractorStyle(pv._vtk.vtkInteractorStyle())
@@ -186,7 +191,8 @@ class MainWindow(QMainWindow):
         try:
             self.source = load_stl(path)
             self.labels = np.zeros(self.source.face_count, dtype=np.uint8)
-            self._cell_tree = cKDTree(self.source.face_centers)
+            self._cell_tree = cKDTree(self.source.face_centers, compact_nodes=True, balanced_tree=True)
+            self._stroke_seen.clear()
             self._render_mesh()
             self._update_info()
             self.statusBar().showMessage("STL загружен. Исходная геометрия сохранена.")
@@ -209,12 +215,22 @@ class MainWindow(QMainWindow):
         if self.source is None:
             return
         self.plotter.clear()
-        self._display_mesh = self.source.mesh.copy(deep=True)
-        # Compute display normals on a copy; the source mesh and face ordering remain untouched.
-        self._display_mesh = self._display_mesh.compute_normals(
+        # STL commonly stores every triangle with duplicated vertices. Merge coincident
+        # display vertices first so adjacent triangles can share averaged point normals.
+        # The source mesh remains untouched; verify cell order/count before using face labels.
+        display_mesh = self.source.mesh.copy(deep=True).clean(
+            point_merging=True,
+            tolerance=1e-8,
+            inplace=False,
+        )
+        if display_mesh.n_cells != self.source.face_count:
+            display_mesh = self.source.mesh.copy(deep=True)
+        self._display_mesh = display_mesh.compute_normals(
             cell_normals=False,
             point_normals=True,
             split_vertices=False,
+            consistent_normals=True,
+            auto_orient_normals=False,
             inplace=False,
         )
         self._display_rgb = np.asarray(
@@ -232,10 +248,10 @@ class MainWindow(QMainWindow):
             lighting=True,
             smooth_shading=True,
             show_edges=False,
-            ambient=0.18,
-            diffuse=0.78,
-            specular=0.32,
-            specular_power=24,
+            ambient=0.08,
+            diffuse=0.88,
+            specular=0.18,
+            specular_power=18,
             name="source_mesh",
         )
         self.plotter.reset_camera()
@@ -251,10 +267,22 @@ class MainWindow(QMainWindow):
         ):
             return
         center = self.source.face_centers[cell_id]
-        affected = np.asarray(
-            self._cell_tree.query_ball_point(center, self.brush_radius),
-            dtype=np.intp,
+        affected_list = self._cell_tree.query_ball_point(
+            center,
+            self.brush_radius,
+            workers=1,
+            return_sorted=False,
         )
+        if not affected_list:
+            return
+        affected = np.fromiter(affected_list, dtype=np.intp, count=len(affected_list))
+        if self._left_button_down and self._stroke_seen:
+            seen = np.fromiter(self._stroke_seen, dtype=np.intp)
+            affected = affected[~np.isin(affected, seen)]
+        if affected.size == 0:
+            return
+        if self._left_button_down:
+            self._stroke_seen.update(map(int, affected))
         if affected.size == 0:
             return
         new_value = int(self.active_label)
