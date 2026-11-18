@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
-from scipy.spatial import cKDTree
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -19,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from pyvistaqt import QtInteractor
+from scipy.spatial import cKDTree
 
 from orto_annotator.core.export import export_dataset_item
 from orto_annotator.core.labels import LABEL_COLORS, LABEL_NAMES, Label
