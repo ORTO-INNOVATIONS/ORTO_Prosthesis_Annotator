@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
+from vtkmodules.vtkCommonDataModel import vtkDataObject, vtkSelectionNode
+from vtkmodules.vtkRenderingCore import vtkHardwareSelector
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -28,7 +30,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.0 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.1 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -38,7 +40,7 @@ class MainWindow(QMainWindow):
         self._left_button_down = False
         self._picker = pv._vtk.vtkCellPicker()
         self._picker.SetTolerance(0.0005)
-        self._hardware_selector = pv._vtk.vtkHardwareSelector()
+        self._hardware_selector = vtkHardwareSelector()
         self._cell_locator = None
         self._last_screen_position: tuple[float, float] | None = None
         self._mesh_actor = None
@@ -201,12 +203,12 @@ class MainWindow(QMainWindow):
         # point picks along a single mouse movement.
         selector = self._hardware_selector
         selector.SetRenderer(renderer)
-        selector.SetFieldAssociation(pv._vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS)
+        selector.SetFieldAssociation(vtkDataObject.FIELD_ASSOCIATION_CELLS)
         selector.SetArea(*area)
         selection = selector.Select()
         selected_ids: list[np.ndarray] = []
         if selection is not None:
-            prop_key = pv._vtk.vtkSelectionNode.PROP()
+            prop_key = vtkSelectionNode.PROP()
             for node_index in range(selection.GetNumberOfNodes()):
                 node = selection.GetNode(node_index)
                 if node.GetProperties().Get(prop_key) != self._mesh_actor:
