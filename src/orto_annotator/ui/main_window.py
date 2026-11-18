@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from pyvistaqt import QtInteractor
+from vtkmodules.vtkFiltersExtraction import vtkExtractCells
 
 from orto_annotator.core.export import export_dataset_item
 from orto_annotator.core.labels import LABEL_COLORS, LABEL_NAMES, Label
@@ -397,7 +398,7 @@ class MainWindow(QMainWindow):
             ids = pv._vtk.vtkIdList()
             for cell_id in range(start, end):
                 ids.InsertNextId(cell_id)
-            extract = pv._vtk.vtkExtractCells()
+            extract = vtkExtractCells()
             extract.SetInputData(self._display_mesh)
             extract.SetCellList(ids)
             extract.Update()
