@@ -30,7 +30,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.6 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.7 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
