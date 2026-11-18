@@ -288,6 +288,12 @@ class MainWindow(QMainWindow):
     def _set_radius(self, value: int) -> None:
         self.brush_radius = float(value)
         self.radius_label.setText(f"{value} мм")
+        if self._brush_outline_source is not None:
+            self._brush_outline_source.SetRadius(self.brush_radius)
+            self._brush_outline_source.Modified()
+            if not self._brush_cursor_render_pending:
+                self._brush_cursor_render_pending = True
+                QTimer.singleShot(16, self._flush_brush_cursor_render)
 
     def set_paint_enabled(self, enabled: bool) -> None:
         self.paint_enabled = enabled
@@ -343,6 +349,8 @@ class MainWindow(QMainWindow):
         if self.source is None:
             return
         self.plotter.clear()
+        self._brush_outline_source = None
+        self._brush_outline_actor = None
         # STL files often duplicate all three vertices per triangle. Merge the
         # display copy, then explicitly generate shared point normals with VTK.
         # The original source mesh and its face order remain the annotation authority.
