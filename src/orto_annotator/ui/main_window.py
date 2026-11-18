@@ -42,7 +42,8 @@ class MainWindow(QMainWindow):
         self._cell_locator = None
         self._paint_render_pending = False
         self._last_pick_position: tuple[int, int] | None = None
-        self._stroke_seen: set[int] = set()
+        self._stroke_marks = np.zeros(0, dtype=np.uint32)
+        self._stroke_id = 0
         self._cell_tree: cKDTree | None = None
         self._display_mesh: pv.PolyData | None = None
         self._display_rgb: np.ndarray | None = None
@@ -120,7 +121,7 @@ class MainWindow(QMainWindow):
             self._left_button_down = True
             self._last_painted_cell = -1
             self._last_pick_position = None
-            self._stroke_seen.clear()
+            self._stroke_id += 1
             self._paint_from_mouse_event(event)
             return True
 
@@ -135,7 +136,6 @@ class MainWindow(QMainWindow):
             self._left_button_down = False
             self._last_painted_cell = -1
             self._last_pick_position = None
-            self._stroke_seen.clear()
             self._update_info()
             return True
 
@@ -173,7 +173,6 @@ class MainWindow(QMainWindow):
         self._left_button_down = False
         self._last_painted_cell = -1
         self._last_pick_position = None
-        self._stroke_seen.clear()
         if enabled:
             # Base VTK style has no camera gestures; Qt events are handled by eventFilter.
             self.plotter.interactor.SetInteractorStyle(pv._vtk.vtkInteractorStyle())
@@ -192,7 +191,8 @@ class MainWindow(QMainWindow):
             self.source = load_stl(path)
             self.labels = np.zeros(self.source.face_count, dtype=np.uint8)
             self._cell_tree = cKDTree(self.source.face_centers, compact_nodes=True, balanced_tree=True)
-            self._stroke_seen.clear()
+            self._stroke_marks = np.zeros(self.source.face_count, dtype=np.uint32)
+            self._stroke_id = 0
             self._render_mesh()
             self._update_info()
             self.statusBar().showMessage("STL загружен. Исходная геометрия сохранена.")
@@ -276,13 +276,12 @@ class MainWindow(QMainWindow):
         if not affected_list:
             return
         affected = np.fromiter(affected_list, dtype=np.intp, count=len(affected_list))
-        if self._left_button_down and self._stroke_seen:
-            seen = np.fromiter(self._stroke_seen, dtype=np.intp)
-            affected = affected[~np.isin(affected, seen)]
-        if affected.size == 0:
-            return
         if self._left_button_down:
-            self._stroke_seen.update(map(int, affected))
+            fresh = self._stroke_marks[affected] != self._stroke_id
+            affected = affected[fresh]
+            if affected.size == 0:
+                return
+            self._stroke_marks[affected] = self._stroke_id
         if affected.size == 0:
             return
         new_value = int(self.active_label)
