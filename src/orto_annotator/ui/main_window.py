@@ -29,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.2 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.3 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -151,7 +151,9 @@ class MainWindow(QMainWindow):
             return
         position = event.position().toPoint()
         x = position.x()
-        y = self.plotter.interactor.height() - position.y()
+        # Keep Qt top-left coordinates throughout the stroke; convert to VTK
+        # bottom-left coordinates exactly once at the picker boundary.
+        y = position.y()
         self._pick_and_paint(x, y)
 
     @staticmethod
@@ -170,27 +172,58 @@ class MainWindow(QMainWindow):
         previous = self._last_screen_position
         self._last_screen_position = current
 
-        # Pick at a spacing related to the brush diameter, not every 2 pixels.
-        # This keeps fast strokes continuous without triggering a GPU selection
-        # render pass for every mouse event.
-        if previous is None:
-            samples = [current]
-        else:
+        # Pick the current cursor position once. The same hit supplies both
+        # the brush centre and the projected brush radius.
+        if not self._picker.Pick(current[0], height - current[1], 0, renderer):
+            return
+        current_cell = int(self._picker.GetCellId())
+        if current_cell < 0 or current_cell >= self.source.face_count:
+            return
+        current_point = np.asarray(self._picker.GetPickPosition(), dtype=np.float64)
+        current_normal = self._face_normals[current_cell]
+
+        camera = renderer.GetActiveCamera()
+        direction = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
+        view_up = np.asarray(camera.GetViewUp(), dtype=np.float64)
+        right = np.cross(direction, view_up)
+        right_norm = float(np.linalg.norm(right))
+        up_norm = float(np.linalg.norm(view_up))
+        radius_px = 12.0
+        if right_norm > 0.0 and up_norm > 0.0:
+            right /= right_norm
+            view_up /= up_norm
+            center_display = self._world_to_display(renderer, current_point)
+            right_display = self._world_to_display(
+                renderer, current_point + right * self.brush_radius
+            )
+            up_display = self._world_to_display(
+                renderer, current_point + view_up * self.brush_radius
+            )
+            radius_px = max(
+                1.0,
+                float(np.linalg.norm(right_display[:2] - center_display[:2])),
+                float(np.linalg.norm(up_display[:2] - center_display[:2])),
+            )
+
+        # Interpolate only as much as needed to keep the stroke continuous.
+        # The current point was already picked above, so it is not picked twice.
+        samples: list[tuple[int, int]] = []
+        if previous is not None:
             dx = current[0] - previous[0]
             dy = current[1] - previous[1]
             distance = float(np.hypot(dx, dy))
-            step_px = max(5.0, min(18.0, self._brush_radius_pixels(x, y) * 0.45))
+            step_px = max(4.0, min(10.0, radius_px * 0.55))
             count = max(1, int(np.ceil(distance / step_px)))
             samples = [
                 (
                     int(round(previous[0] + dx * index / count)),
                     int(round(previous[1] + dy * index / count)),
                 )
-                for index in range(1, count + 1)
+                for index in range(1, count)
             ]
 
-        hit_points: list[np.ndarray] = []
-        hit_normals: list[np.ndarray] = []
+        hit_points: list[np.ndarray] = [current_point]
+        hit_normals: list[np.ndarray] = [current_normal]
         for sample_x, sample_y in samples:
             if not self._picker.Pick(sample_x, height - sample_y, 0, renderer):
                 continue
@@ -200,12 +233,7 @@ class MainWindow(QMainWindow):
             hit_points.append(np.asarray(self._picker.GetPickPosition(), dtype=np.float64))
             hit_normals.append(self._face_normals[cell_id])
 
-        if not hit_points:
-            return
-
-        # One vectorized spatial query handles all interpolated samples in this
-        # mouse event. Oppositely oriented faces are rejected so a nearby back
-        # wall is not painted through a thin shell.
+        # One vectorized spatial query handles every hit from this event.
         groups = self._face_tree.query_ball_point(
             np.asarray(hit_points, dtype=np.float64),
             r=self.brush_radius,
@@ -216,36 +244,12 @@ class MainWindow(QMainWindow):
             if not ids:
                 continue
             face_ids = np.asarray(ids, dtype=np.intp)
-            same_side = self._face_normals[face_ids] @ hit_normal >= 0.0
-            face_ids = face_ids[same_side]
+            face_ids = face_ids[self._face_normals[face_ids] @ hit_normal >= 0.0]
             if face_ids.size:
                 selected.append(face_ids)
 
         if selected:
             self.paint_at(np.unique(np.concatenate(selected)))
-
-    def _brush_radius_pixels(self, x: int, y: int) -> float:
-        if self._picker.Pick(x, self.plotter.interactor.height() - y, 0, self.plotter.renderer):
-            point = np.asarray(self._picker.GetPickPosition(), dtype=np.float64)
-            renderer = self.plotter.renderer
-            camera = renderer.GetActiveCamera()
-            direction = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
-            view_up = np.asarray(camera.GetViewUp(), dtype=np.float64)
-            right = np.cross(direction, view_up)
-            right_norm = float(np.linalg.norm(right))
-            up_norm = float(np.linalg.norm(view_up))
-            if right_norm > 0.0 and up_norm > 0.0:
-                right /= right_norm
-                view_up /= up_norm
-                center = self._world_to_display(renderer, point)
-                right_point = self._world_to_display(renderer, point + right * self.brush_radius)
-                up_point = self._world_to_display(renderer, point + view_up * self.brush_radius)
-                return max(
-                    1.0,
-                    float(np.linalg.norm(right_point[:2] - center[:2])),
-                    float(np.linalg.norm(up_point[:2] - center[:2])),
-                )
-        return 12.0
 
     def set_active_label(self, label: Label) -> None:
         self.active_label = label
