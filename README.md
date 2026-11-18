@@ -2,7 +2,7 @@
 
 Local desktop application for semantic annotation of unified lower-limb prosthesis scans (tibia-level prostheses only).
 
-**Current version:** 0.2.0 TEST
+**Current version:** 0.2.1 TEST
 
 ## Scope
 
