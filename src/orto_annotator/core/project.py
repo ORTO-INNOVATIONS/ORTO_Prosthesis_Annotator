@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +25,7 @@ def save_project(path: str | Path, source: SourceMesh, labels: np.ndarray) -> No
         "format": PROJECT_FORMAT,
         "format_version": PROJECT_FORMAT_VERSION,
         "application_version": "0.1.0",
-        "created_or_saved_at": datetime.now(timezone.utc).isoformat(),
+        "created_or_saved_at": datetime.now(UTC).isoformat(),
         "source": {
             "filename": source.path.name,
             "geometry_fingerprint_sha256": source.fingerprint,
