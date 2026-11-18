@@ -29,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.3 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.4 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -40,6 +40,8 @@ class MainWindow(QMainWindow):
         self._picker = pv._vtk.vtkCellPicker()
         self._picker.SetTolerance(0.0005)
         self._cell_locator = None
+        self._last_screen_position: tuple[float, float] | None = None
+        self._mesh_actor = None
         self._paint_render_pending = False
         self._last_pick_position: tuple[int, int] | None = None
         self._stroke_marks = np.zeros(0, dtype=np.uint32)
@@ -121,6 +123,7 @@ class MainWindow(QMainWindow):
             self._left_button_down = True
             self._last_painted_cell = -1
             self._last_pick_position = None
+            self._last_screen_position = None
             self._stroke_id += 1
             self._paint_from_mouse_event(event)
             return True
@@ -136,6 +139,7 @@ class MainWindow(QMainWindow):
             self._left_button_down = False
             self._last_painted_cell = -1
             self._last_pick_position = None
+            self._last_screen_position = None
             self._update_info()
             return True
 
@@ -146,13 +150,21 @@ class MainWindow(QMainWindow):
             return
         position = event.position().toPoint()
         x, y = position.x(), self.plotter.interactor.height() - position.y()
-        current = (x, y)
-        if self._last_pick_position is not None:
-            dx = x - self._last_pick_position[0]
-            dy = y - self._last_pick_position[1]
-            if dx * dx + dy * dy < 64:
-                return
-        self._last_pick_position = current
+        previous = self._last_screen_position
+        self._last_screen_position = (float(x), float(y))
+        if previous is None:
+            self._pick_and_paint(x, y)
+            return
+        dx, dy = x - previous[0], y - previous[1]
+        distance = float(np.hypot(dx, dy))
+        steps = max(1, int(np.ceil(distance / 2.0)))
+        for step in range(1, steps + 1):
+            t = step / steps
+            sample_x = int(round(previous[0] + dx * t))
+            sample_y = int(round(previous[1] + dy * t))
+            self._pick_and_paint(sample_x, sample_y)
+
+    def _pick_and_paint(self, x: int, y: int) -> None:
         if self._picker.Pick(x, y, 0, self.plotter.renderer):
             cell_id = self._picker.GetCellId()
             if cell_id >= 0:
@@ -173,6 +185,7 @@ class MainWindow(QMainWindow):
         self._left_button_down = False
         self._last_painted_cell = -1
         self._last_pick_position = None
+        self._last_screen_position = None
         if enabled:
             # Base VTK style has no camera gestures; Qt events are handled by eventFilter.
             self.plotter.interactor.SetInteractorStyle(pv._vtk.vtkInteractorStyle())
@@ -215,24 +228,28 @@ class MainWindow(QMainWindow):
         if self.source is None:
             return
         self.plotter.clear()
-        # STL commonly stores every triangle with duplicated vertices. Merge coincident
-        # display vertices first so adjacent triangles can share averaged point normals.
-        # The source mesh remains untouched; verify cell order/count before using face labels.
+        # STL files often duplicate all three vertices per triangle. Merge the
+        # display copy, then explicitly generate shared point normals with VTK.
+        # The original source mesh and its face order remain the annotation authority.
         display_mesh = self.source.mesh.copy(deep=True).clean(
             point_merging=True,
-            tolerance=1e-8,
+            tolerance=1e-7,
             inplace=False,
         )
         if display_mesh.n_cells != self.source.face_count:
-            display_mesh = self.source.mesh.copy(deep=True)
-        self._display_mesh = display_mesh.compute_normals(
-            cell_normals=False,
-            point_normals=True,
-            split_vertices=False,
-            consistent_normals=True,
-            auto_orient_normals=False,
-            inplace=False,
-        )
+            raise RuntimeError("Объединение вершин изменило число граней STL.")
+        normals = pv._vtk.vtkPolyDataNormals()
+        normals.SetInputData(display_mesh)
+        normals.ComputePointNormalsOn()
+        normals.ComputeCellNormalsOff()
+        normals.SplittingOff()
+        normals.ConsistencyOn()
+        normals.AutoOrientNormalsOff()
+        normals.FlipNormalsOff()
+        normals.SetFeatureAngle(180.0)
+        normals.Update()
+        self._display_mesh = pv.wrap(normals.GetOutput())
+        self._display_mesh.GetPointData().SetActiveNormals("Normals")
         self._display_rgb = np.asarray(
             [
                 tuple(round(channel * 255) for channel in LABEL_COLORS[Label(int(value))])
@@ -241,19 +258,38 @@ class MainWindow(QMainWindow):
             dtype=np.uint8,
         )
         self._display_mesh.cell_data["rgb"] = self._display_rgb
-        self.plotter.add_mesh(
+        self._mesh_actor = self.plotter.add_mesh(
             self._display_mesh,
             scalars="rgb",
             rgb=True,
             lighting=True,
             smooth_shading=True,
             show_edges=False,
-            ambient=0.08,
+            ambient=0.12,
             diffuse=0.88,
-            specular=0.18,
-            specular_power=18,
+            specular=0.45,
+            specular_power=32,
             name="source_mesh",
         )
+        prop = self._mesh_actor.GetProperty()
+        prop.SetLighting(True)
+        prop.SetInterpolationToPhong()
+        prop.SetAmbient(0.12)
+        prop.SetDiffuse(0.88)
+        prop.SetSpecular(0.45)
+        prop.SetSpecularPower(32)
+        prop.SetColor(0.82, 0.84, 0.88)
+        prop.SetBackfaceCulling(False)
+        renderer = self.plotter.renderer
+        renderer.RemoveAllLights()
+        key_light = pv._vtk.vtkLight()
+        key_light.SetLightTypeToHeadlight()
+        key_light.SetIntensity(1.15)
+        renderer.AddLight(key_light)
+        fill_light = pv._vtk.vtkLight()
+        fill_light.SetLightTypeToCameraLight()
+        fill_light.SetIntensity(0.35)
+        renderer.AddLight(fill_light)
         self.plotter.reset_camera()
         self.plotter.render()
 
