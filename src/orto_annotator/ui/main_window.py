@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from pyvistaqt import QtInteractor
-from vtkmodules.vtkFiltersExtraction import vtkExtractCells
 
 from orto_annotator.core.export import export_dataset_item
 from orto_annotator.core.labels import LABEL_COLORS, LABEL_NAMES, Label
@@ -395,14 +394,19 @@ class MainWindow(QMainWindow):
         face_count = self.source.face_count
         for start in range(0, face_count, block_size):
             end = min(start + block_size, face_count)
-            ids = pv._vtk.vtkIdList()
-            for cell_id in range(start, end):
-                ids.InsertNextId(cell_id)
-            extract = vtkExtractCells()
-            extract.SetInputData(self._display_mesh)
-            extract.SetCellList(ids)
-            extract.Update()
-            block_mesh = pv.wrap(extract.GetOutput())
+            # Build a PolyData batch directly from the corresponding source
+            # triangles. This avoids relying on VTK extraction classes whose
+            # Python module exports differ between bundled VTK versions.
+            source_faces = np.asarray(self._display_mesh.faces, dtype=np.int64).reshape(-1, 4)
+            block_faces = source_faces[start:end].reshape(-1)
+            block_mesh = pv.PolyData(
+                np.asarray(self._display_mesh.points),
+                faces=block_faces,
+            )
+            point_normals = self._display_mesh.point_data.get("Normals")
+            if point_normals is not None:
+                block_mesh.point_data["Normals"] = np.asarray(point_normals)
+                block_mesh.GetPointData().SetActiveNormals("Normals")
             block_rgb = np.asarray(
                 [
                     tuple(round(channel * 255) for channel in LABEL_COLORS[Label(int(value))])
