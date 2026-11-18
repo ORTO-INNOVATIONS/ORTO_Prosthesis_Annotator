@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
+from scipy.spatial import cKDTree
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -28,14 +29,21 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.0 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.1 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
         self.active_label = Label.SOCKET
         self.brush_radius = 12.0
         self.paint_enabled = False
+        self._left_button_down = False
         self._picker_observer = None
+        self._move_observer = None
+        self._release_observer = None
+        self._cell_tree: cKDTree | None = None
+        self._display_mesh: pv.PolyData | None = None
+        self._display_rgb: np.ndarray | None = None
+        self._last_painted_cell = -1
 
         self.plotter = QtInteractor(self)
         self.plotter.set_background("#20252d")
@@ -104,16 +112,34 @@ class MainWindow(QMainWindow):
         picker = pv._vtk.vtkCellPicker()
         picker.SetTolerance(0.0005)
 
-        def on_click(_obj, _event) -> None:
+        def pick_and_paint(_obj, _event) -> None:
             if not self.paint_enabled or self.source is None:
                 return
             x, y = self.plotter.interactor.GetEventPosition()
             if picker.Pick(x, y, 0, self.plotter.renderer):
                 cell_id = picker.GetCellId()
-                if cell_id >= 0:
+                if cell_id >= 0 and cell_id != self._last_painted_cell:
+                    self._last_painted_cell = cell_id
                     self.paint_at(cell_id)
 
-        self._picker_observer = self.plotter.interactor.AddObserver("LeftButtonPressEvent", on_click)
+        def on_press(_obj, _event) -> None:
+            if self.paint_enabled:
+                self._left_button_down = True
+                self._last_painted_cell = -1
+                pick_and_paint(_obj, _event)
+
+        def on_move(_obj, _event) -> None:
+            if self.paint_enabled and self._left_button_down:
+                pick_and_paint(_obj, _event)
+
+        def on_release(_obj, _event) -> None:
+            self._left_button_down = False
+            self._last_painted_cell = -1
+
+        interactor = self.plotter.interactor
+        self._picker_observer = interactor.AddObserver("LeftButtonPressEvent", on_press, 1.0)
+        self._move_observer = interactor.AddObserver("MouseMoveEvent", on_move, 1.0)
+        self._release_observer = interactor.AddObserver("LeftButtonReleaseEvent", on_release, 1.0)
 
     def set_active_label(self, label: Label) -> None:
         self.active_label = label
@@ -127,8 +153,17 @@ class MainWindow(QMainWindow):
 
     def set_paint_enabled(self, enabled: bool) -> None:
         self.paint_enabled = enabled
-        self.paint_button.setText("Разметка включена — вращение отключено" if enabled else "Включить разметку")
-        self.statusBar().showMessage("Щёлкните по поверхности для нанесения метки." if enabled else "Режим просмотра.")
+        self._left_button_down = False
+        self._last_painted_cell = -1
+        if enabled:
+            # A user style has no default camera gestures, so left-drag is reserved for painting.
+            self.plotter.interactor.SetInteractorStyle(pv._vtk.vtkInteractorStyleUser())
+            self.paint_button.setText("Разметка включена — ЛКМ рисует")
+            self.statusBar().showMessage("Зажмите левую кнопку и ведите кисть по поверхности.")
+        else:
+            self.plotter.enable_trackball_style()
+            self.paint_button.setText("Включить разметку")
+            self.statusBar().showMessage("Режим просмотра: левая кнопка вращает модель.")
 
     def open_stl(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Открыть скан протеза", "", "STL (*.stl)")
@@ -137,45 +172,16 @@ class MainWindow(QMainWindow):
         try:
             self.source = load_stl(path)
             self.labels = np.zeros(self.source.face_count, dtype=np.uint8)
+            self._cell_tree = cKDTree(self.source.face_centers)
             self._render_mesh()
-            self.info_label.setText(
-                f"{self.source.path.name}\n"
-                f"Вершин: {self.source.mesh.n_points:,}\n"
-                f"Треугольников: {self.source.face_count:,}\n"
-                f"Размечено: 0%"
-            )
-            self.statusBar().showMessage("STL загружен. Геометрия исходной сетки сохранена.")
+            self._update_info()
+            self.statusBar().showMessage("STL загружен. Исходная геометрия сохранена.")
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Ошибка загрузки STL", str(exc))
 
-    def _render_mesh(self) -> None:
+    def _update_info(self) -> None:
         if self.source is None:
             return
-        self.plotter.clear()
-        mesh = self.source.mesh.copy(deep=True)
-        mesh.cell_data["label"] = self.labels
-        colors = np.asarray([LABEL_COLORS[Label(int(value))] for value in self.labels], dtype=float)
-        mesh.cell_data["rgb"] = colors
-        self.plotter.add_mesh(
-            mesh,
-            scalars="rgb",
-            rgb=True,
-            lighting=True,
-            smooth_shading=True,
-            show_edges=False,
-            name="source_mesh",
-        )
-        self.plotter.reset_camera()
-        self.plotter.render()
-
-    def paint_at(self, cell_id: int) -> None:
-        if self.source is None or not 0 <= cell_id < self.source.face_count:
-            return
-        center = self.source.face_centers[cell_id]
-        distances = np.linalg.norm(self.source.face_centers - center, axis=1)
-        affected = np.flatnonzero(distances <= self.brush_radius)
-        self.labels[affected] = int(self.active_label)
-        self._render_mesh()
         labeled = int(np.count_nonzero(self.labels != int(Label.UNLABELED)))
         percent = 100.0 * labeled / max(1, self.source.face_count)
         self.info_label.setText(
@@ -185,6 +191,75 @@ class MainWindow(QMainWindow):
             f"Размечено: {percent:.1f}%"
         )
 
+    def _render_mesh(self) -> None:
+        if self.source is None:
+            return
+        self.plotter.clear()
+        self._display_mesh = self.source.mesh.copy(deep=True)
+        # Compute display normals on a copy; the source mesh and face ordering remain untouched.
+        self._display_mesh = self._display_mesh.compute_normals(
+            cell_normals=False,
+            point_normals=True,
+            split_vertices=False,
+            inplace=False,
+        )
+        self._display_rgb = np.asarray(
+            [
+                tuple(round(channel * 255) for channel in LABEL_COLORS[Label(int(value))])
+                for value in self.labels
+            ],
+            dtype=np.uint8,
+        )
+        self._display_mesh.cell_data["rgb"] = self._display_rgb
+        self.plotter.add_mesh(
+            self._display_mesh,
+            scalars="rgb",
+            rgb=True,
+            lighting=True,
+            smooth_shading=True,
+            show_edges=False,
+            ambient=0.18,
+            diffuse=0.78,
+            specular=0.32,
+            specular_power=24,
+            name="source_mesh",
+        )
+        self.plotter.reset_camera()
+        self.plotter.render()
+
+    def paint_at(self, cell_id: int) -> None:
+        if (
+            self.source is None
+            or self._cell_tree is None
+            or self._display_mesh is None
+            or self._display_rgb is None
+            or not 0 <= cell_id < self.source.face_count
+        ):
+            return
+        center = self.source.face_centers[cell_id]
+        affected = np.asarray(
+            self._cell_tree.query_ball_point(center, self.brush_radius),
+            dtype=np.intp,
+        )
+        if affected.size == 0:
+            return
+        new_value = int(self.active_label)
+        changed = affected[self.labels[affected] != new_value]
+        if changed.size == 0:
+            return
+        self.labels[changed] = new_value
+        color = np.asarray(
+            tuple(round(channel * 255) for channel in LABEL_COLORS[self.active_label]),
+            dtype=np.uint8,
+        )
+        self._display_rgb[changed] = color
+        vtk_colors = self._display_mesh.GetCellData().GetArray("rgb")
+        if vtk_colors is not None:
+            vtk_colors.Modified()
+        self._display_mesh.Modified()
+        self.plotter.render()
+        self._update_info()
+
     def save_current_project(self) -> None:
         if self.source is None:
             return
@@ -193,7 +268,7 @@ class MainWindow(QMainWindow):
             try:
                 save_project(path, self.source, self.labels)
                 self.statusBar().showMessage(f"Проект сохранён: {path}")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 QMessageBox.critical(self, "Ошибка сохранения", str(exc))
 
     def load_current_project(self) -> None:
@@ -205,8 +280,9 @@ class MainWindow(QMainWindow):
             try:
                 self.labels = load_project(path, self.source)
                 self._render_mesh()
+                self._update_info()
                 self.statusBar().showMessage("Разметка загружена.")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 QMessageBox.critical(self, "Ошибка загрузки проекта", str(exc))
 
     def export_current(self) -> None:
@@ -217,5 +293,5 @@ class MainWindow(QMainWindow):
             try:
                 paths = export_dataset_item(directory, self.source, self.labels)
                 QMessageBox.information(self, "Экспорт завершён", "\n".join(str(path) for path in paths))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 QMessageBox.critical(self, "Ошибка экспорта", str(exc))
