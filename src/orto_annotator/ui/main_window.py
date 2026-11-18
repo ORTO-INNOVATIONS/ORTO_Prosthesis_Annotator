@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -29,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.1 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.2 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -37,9 +37,10 @@ class MainWindow(QMainWindow):
         self.brush_radius = 12.0
         self.paint_enabled = False
         self._left_button_down = False
-        self._picker_observer = None
-        self._move_observer = None
-        self._release_observer = None
+        self._picker = pv._vtk.vtkCellPicker()
+        self._picker.SetTolerance(0.0005)
+        self._paint_render_pending = False
+        self._last_pick_position: tuple[int, int] | None = None
         self._cell_tree: cKDTree | None = None
         self._display_mesh: pv.PolyData | None = None
         self._display_rgb: np.ndarray | None = None
@@ -48,6 +49,7 @@ class MainWindow(QMainWindow):
         self.plotter = QtInteractor(self)
         self.plotter.set_background("#20252d")
         self.plotter.enable_trackball_style()
+        self.plotter.interactor.installEventFilter(self)
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -106,40 +108,51 @@ class MainWindow(QMainWindow):
         layout.addLayout(side, 0)
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar(self))
-        self._install_picker()
 
-    def _install_picker(self) -> None:
-        picker = pv._vtk.vtkCellPicker()
-        picker.SetTolerance(0.0005)
+    def eventFilter(self, watched, event) -> bool:
+        if watched is not self.plotter.interactor or not self.paint_enabled:
+            return super().eventFilter(watched, event)
 
-        def pick_and_paint(_obj, _event) -> None:
-            if not self.paint_enabled or self.source is None:
-                return
-            x, y = self.plotter.interactor.GetEventPosition()
-            if picker.Pick(x, y, 0, self.plotter.renderer):
-                cell_id = picker.GetCellId()
-                if cell_id >= 0 and cell_id != self._last_painted_cell:
-                    self._last_painted_cell = cell_id
-                    self.paint_at(cell_id)
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            self._left_button_down = True
+            self._last_painted_cell = -1
+            self._last_pick_position = None
+            self._paint_from_mouse_event(event)
+            return True
 
-        def on_press(_obj, _event) -> None:
-            if self.paint_enabled:
-                self._left_button_down = True
-                self._last_painted_cell = -1
-                pick_and_paint(_obj, _event)
+        if event_type == QEvent.Type.MouseMove:
+            if self._left_button_down and event.buttons() & Qt.MouseButton.LeftButton:
+                self._paint_from_mouse_event(event)
+                return True
+            self._left_button_down = False
+            return True
 
-        def on_move(_obj, _event) -> None:
-            if self.paint_enabled and self._left_button_down:
-                pick_and_paint(_obj, _event)
-
-        def on_release(_obj, _event) -> None:
+        if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
             self._left_button_down = False
             self._last_painted_cell = -1
+            self._last_pick_position = None
+            self._update_info()
+            return True
 
-        interactor = self.plotter.interactor
-        self._picker_observer = interactor.AddObserver("LeftButtonPressEvent", on_press, 1.0)
-        self._move_observer = interactor.AddObserver("MouseMoveEvent", on_move, 1.0)
-        self._release_observer = interactor.AddObserver("LeftButtonReleaseEvent", on_release, 1.0)
+        return super().eventFilter(watched, event)
+
+    def _paint_from_mouse_event(self, event) -> None:
+        if self.source is None:
+            return
+        position = event.position().toPoint()
+        x, y = position.x(), self.plotter.interactor.height() - position.y()
+        current = (x, y)
+        if self._last_pick_position is not None:
+            dx = x - self._last_pick_position[0]
+            dy = y - self._last_pick_position[1]
+            if dx * dx + dy * dy < 9:
+                return
+        self._last_pick_position = current
+        if self._picker.Pick(x, y, 0, self.plotter.renderer):
+            cell_id = self._picker.GetCellId()
+            if cell_id >= 0:
+                self.paint_at(cell_id)
 
     def set_active_label(self, label: Label) -> None:
         self.active_label = label
@@ -155,9 +168,10 @@ class MainWindow(QMainWindow):
         self.paint_enabled = enabled
         self._left_button_down = False
         self._last_painted_cell = -1
+        self._last_pick_position = None
         if enabled:
-            # A user style has no default camera gestures, so left-drag is reserved for painting.
-            self.plotter.interactor.SetInteractorStyle(pv._vtk.vtkInteractorStyleUser())
+            # Base VTK style has no camera gestures; Qt events are handled by eventFilter.
+            self.plotter.interactor.SetInteractorStyle(pv._vtk.vtkInteractorStyle())
             self.paint_button.setText("Разметка включена — ЛКМ рисует")
             self.statusBar().showMessage("Зажмите левую кнопку и ведите кисть по поверхности.")
         else:
@@ -257,8 +271,13 @@ class MainWindow(QMainWindow):
         if vtk_colors is not None:
             vtk_colors.Modified()
         self._display_mesh.Modified()
+        if not self._paint_render_pending:
+            self._paint_render_pending = True
+            QTimer.singleShot(16, self._flush_paint_render)
+
+    def _flush_paint_render(self) -> None:
+        self._paint_render_pending = False
         self.plotter.render()
-        self._update_info()
 
     def save_current_project(self) -> None:
         if self.source is None:
