@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from pyvistaqt import QtInteractor
-from scipy.spatial import cKDTree
 
 from orto_annotator.core.export import export_dataset_item
 from orto_annotator.core.labels import LABEL_COLORS, LABEL_NAMES, Label
@@ -29,7 +28,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.1.4 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.0 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -39,6 +38,7 @@ class MainWindow(QMainWindow):
         self._left_button_down = False
         self._picker = pv._vtk.vtkCellPicker()
         self._picker.SetTolerance(0.0005)
+        self._hardware_selector = pv._vtk.vtkHardwareSelector()
         self._cell_locator = None
         self._last_screen_position: tuple[float, float] | None = None
         self._mesh_actor = None
@@ -46,7 +46,6 @@ class MainWindow(QMainWindow):
         self._last_pick_position: tuple[int, int] | None = None
         self._stroke_marks = np.zeros(0, dtype=np.uint32)
         self._stroke_id = 0
-        self._cell_tree: cKDTree | None = None
         self._display_mesh: pv.PolyData | None = None
         self._display_rgb: np.ndarray | None = None
         self._last_painted_cell = -1
@@ -149,26 +148,89 @@ class MainWindow(QMainWindow):
         if self.source is None:
             return
         position = event.position().toPoint()
-        x, y = position.x(), self.plotter.interactor.height() - position.y()
-        previous = self._last_screen_position
-        self._last_screen_position = (float(x), float(y))
-        if previous is None:
-            self._pick_and_paint(x, y)
-            return
-        dx, dy = x - previous[0], y - previous[1]
-        distance = float(np.hypot(dx, dy))
-        steps = max(1, int(np.ceil(distance / 2.0)))
-        for step in range(1, steps + 1):
-            t = step / steps
-            sample_x = int(round(previous[0] + dx * t))
-            sample_y = int(round(previous[1] + dy * t))
-            self._pick_and_paint(sample_x, sample_y)
+        x = position.x()
+        y = self.plotter.interactor.height() - position.y()
+        self._pick_and_paint(x, y)
+
+    @staticmethod
+    def _world_to_display(renderer, point: np.ndarray) -> np.ndarray:
+        renderer.SetWorldPoint(float(point[0]), float(point[1]), float(point[2]), 1.0)
+        renderer.WorldToDisplay()
+        return np.asarray(renderer.GetDisplayPoint(), dtype=np.float64)
 
     def _pick_and_paint(self, x: int, y: int) -> None:
-        if self._picker.Pick(x, y, 0, self.plotter.renderer):
-            cell_id = self._picker.GetCellId()
-            if cell_id >= 0:
-                self.paint_at(cell_id)
+        if self.source is None or self._mesh_actor is None or self._display_mesh is None:
+            return
+        renderer = self.plotter.renderer
+        if not self._picker.Pick(x, y, 0, renderer):
+            return
+        cell_id = int(self._picker.GetCellId())
+        if cell_id < 0:
+            return
+
+        pick_position = np.asarray(self._picker.GetPickPosition(), dtype=np.float64)
+        camera = renderer.GetActiveCamera()
+        direction = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
+        view_up = np.asarray(camera.GetViewUp(), dtype=np.float64)
+        right = np.cross(direction, view_up)
+        right_norm = float(np.linalg.norm(right))
+        up_norm = float(np.linalg.norm(view_up))
+        if right_norm == 0.0 or up_norm == 0.0:
+            self.paint_at(cell_id)
+            return
+        right /= right_norm
+        view_up /= up_norm
+
+        center_display = self._world_to_display(renderer, pick_position)
+        right_display = self._world_to_display(renderer, pick_position + right * self.brush_radius)
+        up_display = self._world_to_display(renderer, pick_position + view_up * self.brush_radius)
+        radius_px = max(
+            float(np.linalg.norm(right_display[:2] - center_display[:2])),
+            float(np.linalg.norm(up_display[:2] - center_display[:2])),
+        )
+        width, height = renderer.GetSize()
+        radius_px = max(1, int(np.ceil(radius_px)))
+        area = (
+            max(0, x - radius_px),
+            max(0, y - radius_px),
+            min(width - 1, x + radius_px),
+            min(height - 1, y + radius_px),
+        )
+
+        # One GPU hardware-selection pass replaces hundreds of CPU-side
+        # point picks along a single mouse movement.
+        selector = self._hardware_selector
+        selector.SetRenderer(renderer)
+        selector.SetFieldAssociation(pv._vtk.vtkDataObject.FIELD_ASSOCIATION_CELLS)
+        selector.SetArea(*area)
+        selection = selector.Select()
+        selected_ids: list[np.ndarray] = []
+        if selection is not None:
+            prop_key = pv._vtk.vtkSelectionNode.PROP()
+            for node_index in range(selection.GetNumberOfNodes()):
+                node = selection.GetNode(node_index)
+                if node.GetProperties().Get(prop_key) != self._mesh_actor:
+                    continue
+                vtk_ids = node.GetSelectionList()
+                if vtk_ids is not None and vtk_ids.GetNumberOfTuples():
+                    selected_ids.append(
+                        np.fromiter(
+                            (vtk_ids.GetValue(i) for i in range(vtk_ids.GetNumberOfTuples())),
+                            dtype=np.intp,
+                        )
+                    )
+
+        if not selected_ids:
+            self.paint_at(cell_id)
+            return
+        affected = np.unique(np.concatenate(selected_ids))
+        affected = affected[(affected >= 0) & (affected < self.source.face_count)]
+        if affected.size:
+            offsets = self.source.face_centers[affected] - pick_position
+            inside_brush = np.einsum("ij,ij->i", offsets, offsets) <= self.brush_radius**2
+            affected = affected[inside_brush]
+        if affected.size:
+            self.paint_at(affected)
 
     def set_active_label(self, label: Label) -> None:
         self.active_label = label
@@ -203,7 +265,6 @@ class MainWindow(QMainWindow):
         try:
             self.source = load_stl(path)
             self.labels = np.zeros(self.source.face_count, dtype=np.uint8)
-            self._cell_tree = cKDTree(self.source.face_centers, compact_nodes=True, balanced_tree=True)
             self._stroke_marks = np.zeros(self.source.face_count, dtype=np.uint32)
             self._stroke_id = 0
             self._render_mesh()
@@ -298,33 +359,24 @@ class MainWindow(QMainWindow):
         self.plotter.reset_camera()
         self.plotter.render()
 
-    def paint_at(self, cell_id: int) -> None:
+    def paint_at(self, cell_ids: int | np.ndarray) -> None:
         if (
             self.source is None
-            or self._cell_tree is None
             or self._display_mesh is None
             or self._display_rgb is None
-            or not 0 <= cell_id < self.source.face_count
         ):
             return
-        center = self.source.face_centers[cell_id]
-        affected_list = self._cell_tree.query_ball_point(
-            center,
-            self.brush_radius,
-            workers=1,
-            return_sorted=False,
-        )
-        if not affected_list:
+        affected = np.atleast_1d(np.asarray(cell_ids, dtype=np.intp))
+        affected = affected[(affected >= 0) & (affected < self.source.face_count)]
+        if affected.size == 0:
             return
-        affected = np.fromiter(affected_list, dtype=np.intp, count=len(affected_list))
+        affected = np.unique(affected)
         if self._left_button_down:
             fresh = self._stroke_marks[affected] != self._stroke_id
             affected = affected[fresh]
             if affected.size == 0:
                 return
             self._stroke_marks[affected] = self._stroke_id
-        if affected.size == 0:
-            return
         new_value = int(self.active_label)
         changed = affected[self.labels[affected] != new_value]
         if changed.size == 0:
