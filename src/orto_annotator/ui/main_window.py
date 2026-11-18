@@ -108,7 +108,6 @@ class MainWindow(QMainWindow):
         layout.addLayout(side, 0)
         self.setCentralWidget(central)
         self.setStatusBar(QStatusBar(self))
-        self._install_picker()
 
     def eventFilter(self, watched, event) -> bool:
         if watched is not self.plotter.interactor or not self.paint_enabled:
@@ -133,6 +132,7 @@ class MainWindow(QMainWindow):
             self._left_button_down = False
             self._last_painted_cell = -1
             self._last_pick_position = None
+            self._update_info()
             return True
 
         return super().eventFilter(watched, event)
