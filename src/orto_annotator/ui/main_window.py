@@ -29,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.3 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.4 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -51,6 +51,11 @@ class MainWindow(QMainWindow):
         self._display_mesh: pv.PolyData | None = None
         self._display_rgb: np.ndarray | None = None
         self._last_painted_cell = -1
+        self._last_world_position: np.ndarray | None = None
+        self._last_world_normal: np.ndarray | None = None
+        self._brush_outline_source = None
+        self._brush_outline_actor = None
+        self._brush_cursor_render_pending = False
 
         self.plotter = QtInteractor(self)
         self.plotter.set_background("#20252d")
@@ -116,33 +121,40 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
 
     def eventFilter(self, watched, event) -> bool:
-        if watched is not self.plotter.interactor or not self.paint_enabled:
+        if watched is not self.plotter.interactor:
             return super().eventFilter(watched, event)
 
         event_type = event.type()
         if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-            self._left_button_down = True
-            self._last_painted_cell = -1
-            self._last_pick_position = None
-            self._last_screen_position = None
-            self._stroke_id += 1
-            self._paint_from_mouse_event(event)
-            return True
-
-        if event_type == QEvent.Type.MouseMove:
-            if self._left_button_down and event.buttons() & Qt.MouseButton.LeftButton:
+            if self.paint_enabled:
+                self._left_button_down = True
+                self._last_painted_cell = -1
+                self._last_pick_position = None
+                self._last_screen_position = None
+                self._last_world_position = None
+                self._last_world_normal = None
+                self._stroke_id += 1
                 self._paint_from_mouse_event(event)
                 return True
-            self._left_button_down = False
-            return True
+
+        if event_type == QEvent.Type.MouseMove:
+            if self.paint_enabled and self._left_button_down and event.buttons() & Qt.MouseButton.LeftButton:
+                self._paint_from_mouse_event(event)
+                return True
+            self._update_brush_cursor(event.position().toPoint().x(), event.position().toPoint().y())
+            if self.paint_enabled:
+                return True
 
         if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-            self._left_button_down = False
-            self._last_painted_cell = -1
-            self._last_pick_position = None
-            self._last_screen_position = None
-            self._update_info()
-            return True
+            if self.paint_enabled:
+                self._left_button_down = False
+                self._last_painted_cell = -1
+                self._last_pick_position = None
+                self._last_screen_position = None
+                self._last_world_position = None
+                self._last_world_normal = None
+                self._update_info()
+                return True
 
         return super().eventFilter(watched, event)
 
@@ -167,78 +179,42 @@ class MainWindow(QMainWindow):
             return
 
         renderer = self.plotter.renderer
-        width, height = renderer.GetSize()
-        current = (int(x), int(y))
-        previous = self._last_screen_position
-        self._last_screen_position = current
-
-        # Pick the current cursor position once. The same hit supplies both
-        # the brush centre and the projected brush radius.
-        if not self._picker.Pick(current[0], height - current[1], 0, renderer):
+        height = renderer.GetSize()[1]
+        if not self._picker.Pick(int(x), height - int(y), 0, renderer):
+            self._hide_brush_cursor()
+            self._last_screen_position = (int(x), int(y))
+            self._last_world_position = None
+            self._last_world_normal = None
             return
-        current_cell = int(self._picker.GetCellId())
-        if current_cell < 0 or current_cell >= self.source.face_count:
+
+        cell_id = int(self._picker.GetCellId())
+        if cell_id < 0 or cell_id >= self.source.face_count:
+            self._hide_brush_cursor()
             return
         current_point = np.asarray(self._picker.GetPickPosition(), dtype=np.float64)
-        current_normal = self._face_normals[current_cell]
+        current_normal = self._face_normals[cell_id]
+        self._update_brush_outline(current_point, current_normal)
+        previous_point = self._last_world_position
+        previous_normal = self._last_world_normal
+        self._last_screen_position = (int(x), int(y))
+        self._last_world_position = current_point.copy()
+        self._last_world_normal = current_normal.copy()
 
-        camera = renderer.GetActiveCamera()
-        direction = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
-        view_up = np.asarray(camera.GetViewUp(), dtype=np.float64)
-        right = np.cross(direction, view_up)
-        right_norm = float(np.linalg.norm(right))
-        up_norm = float(np.linalg.norm(view_up))
-        radius_px = 12.0
-        if right_norm > 0.0 and up_norm > 0.0:
-            right /= right_norm
-            view_up /= up_norm
-            center_display = self._world_to_display(renderer, current_point)
-            right_display = self._world_to_display(
-                renderer, current_point + right * self.brush_radius
-            )
-            up_display = self._world_to_display(
-                renderer, current_point + view_up * self.brush_radius
-            )
-            radius_px = max(
-                1.0,
-                float(np.linalg.norm(right_display[:2] - center_display[:2])),
-                float(np.linalg.norm(up_display[:2] - center_display[:2])),
-            )
+        # Interpolate surface-hit points in world space; only the actual cursor
+        # position requires a VTK pick. Intermediate centres are NumPy-generated.
+        hit_points = [current_point]
+        hit_normals = [current_normal]
+        if previous_point is not None and previous_normal is not None:
+            distance = float(np.linalg.norm(current_point - previous_point))
+            step_mm = max(1.0, self.brush_radius * 0.45)
+            count = max(1, int(np.ceil(distance / step_mm)))
+            if count > 1:
+                fractions = np.arange(1, count, dtype=np.float64)[:, None] / count
+                interpolated = previous_point[None, :] + fractions * (current_point - previous_point)[None, :]
+                hit_points = [*interpolated, current_point]
+                hit_normals = [*([previous_normal] * len(interpolated)), current_normal]
 
-        # Interpolate only as much as needed to keep the stroke continuous.
-        # The current point was already picked above, so it is not picked twice.
-        samples: list[tuple[int, int]] = []
-        if previous is not None:
-            dx = current[0] - previous[0]
-            dy = current[1] - previous[1]
-            distance = float(np.hypot(dx, dy))
-            step_px = max(4.0, min(10.0, radius_px * 0.55))
-            count = max(1, int(np.ceil(distance / step_px)))
-            samples = [
-                (
-                    int(round(previous[0] + dx * index / count)),
-                    int(round(previous[1] + dy * index / count)),
-                )
-                for index in range(1, count)
-            ]
-
-        hit_points: list[np.ndarray] = [current_point]
-        hit_normals: list[np.ndarray] = [current_normal]
-        for sample_x, sample_y in samples:
-            if not self._picker.Pick(sample_x, height - sample_y, 0, renderer):
-                continue
-            cell_id = int(self._picker.GetCellId())
-            if cell_id < 0 or cell_id >= self.source.face_count:
-                continue
-            hit_points.append(np.asarray(self._picker.GetPickPosition(), dtype=np.float64))
-            hit_normals.append(self._face_normals[cell_id])
-
-        # One vectorized spatial query handles every hit from this event.
-        groups = self._face_tree.query_ball_point(
-            np.asarray(hit_points, dtype=np.float64),
-            r=self.brush_radius,
-            return_sorted=False,
-        )
+        groups = self._face_tree.query_ball_point(np.asarray(hit_points, dtype=np.float64), r=self.brush_radius, return_sorted=False)
         selected: list[np.ndarray] = []
         for ids, hit_normal in zip(groups, hit_normals, strict=True):
             if not ids:
@@ -247,9 +223,61 @@ class MainWindow(QMainWindow):
             face_ids = face_ids[self._face_normals[face_ids] @ hit_normal >= 0.0]
             if face_ids.size:
                 selected.append(face_ids)
-
         if selected:
             self.paint_at(np.unique(np.concatenate(selected)))
+
+    def _update_brush_cursor(self, x: int, y: int) -> None:
+        if self.source is None or self._mesh_actor is None:
+            self._hide_brush_cursor()
+            return
+        height = self.plotter.renderer.GetSize()[1]
+        if not self._picker.Pick(int(x), height - int(y), 0, self.plotter.renderer):
+            self._hide_brush_cursor()
+            return
+        cell_id = int(self._picker.GetCellId())
+        if cell_id < 0 or cell_id >= self.source.face_count:
+            self._hide_brush_cursor()
+            return
+        point = np.asarray(self._picker.GetPickPosition(), dtype=np.float64)
+        self._update_brush_outline(point, self._face_normals[cell_id])
+
+    def _update_brush_outline(self, center: np.ndarray, normal: np.ndarray) -> None:
+        if self._brush_outline_source is None:
+            source = pv._vtk.vtkRegularPolygonSource()
+            source.SetNumberOfSides(64)
+            source.SetRadius(self.brush_radius)
+            source.GeneratePolygonOff()
+            mapper = pv._vtk.vtkPolyDataMapper()
+            mapper.SetInputConnection(source.GetOutputPort())
+            actor = pv._vtk.vtkActor()
+            actor.SetMapper(mapper)
+            actor.GetProperty().SetColor(1.0, 1.0, 1.0)
+            actor.GetProperty().SetLineWidth(2.0)
+            actor.GetProperty().SetLighting(False)
+            actor.PickableOff()
+            self.plotter.renderer.AddActor(actor)
+            self._brush_outline_source = source
+            self._brush_outline_actor = actor
+        source = self._brush_outline_source
+        source.SetCenter(float(center[0]), float(center[1]), float(center[2]))
+        source.SetNormal(float(normal[0]), float(normal[1]), float(normal[2]))
+        source.SetRadius(float(self.brush_radius))
+        source.Modified()
+        self._brush_outline_actor.SetVisibility(True)
+        if not self._brush_cursor_render_pending:
+            self._brush_cursor_render_pending = True
+            QTimer.singleShot(16, self._flush_brush_cursor_render)
+
+    def _hide_brush_cursor(self) -> None:
+        if self._brush_outline_actor is not None and self._brush_outline_actor.GetVisibility():
+            self._brush_outline_actor.SetVisibility(False)
+            if not self._brush_cursor_render_pending:
+                self._brush_cursor_render_pending = True
+                QTimer.singleShot(16, self._flush_brush_cursor_render)
+
+    def _flush_brush_cursor_render(self) -> None:
+        self._brush_cursor_render_pending = False
+        self.plotter.render()
 
     def set_active_label(self, label: Label) -> None:
         self.active_label = label
