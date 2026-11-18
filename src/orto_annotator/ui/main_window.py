@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
-from pyvistaqt import QtInteractor
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -18,6 +17,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from pyvistaqt import QtInteractor
 
 from orto_annotator.core.export import export_dataset_item
 from orto_annotator.core.labels import LABEL_COLORS, LABEL_NAMES, Label
@@ -145,7 +145,7 @@ class MainWindow(QMainWindow):
                 f"Размечено: 0%"
             )
             self.statusBar().showMessage("STL загружен. Геометрия исходной сетки сохранена.")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Ошибка загрузки STL", str(exc))
 
     def _render_mesh(self) -> None:
