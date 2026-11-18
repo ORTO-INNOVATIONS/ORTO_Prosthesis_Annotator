@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Local scans and annotation data — never commit patient/model data
+data/
+scans/
+projects/
+exports/
+*.stl
+*.STL
+*.npz
+*.pt
+*.pth
+*.onnx
+
+# Build
+build/
+dist/
