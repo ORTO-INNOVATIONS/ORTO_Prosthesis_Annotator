@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
-from vtkmodules.vtkCommonDataModel import vtkDataObject, vtkSelectionNode
-from vtkmodules.vtkRenderingCore import vtkHardwareSelector
+from scipy.spatial import cKDTree
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -30,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.1 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.2 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -40,7 +39,8 @@ class MainWindow(QMainWindow):
         self._left_button_down = False
         self._picker = pv._vtk.vtkCellPicker()
         self._picker.SetTolerance(0.0005)
-        self._hardware_selector = vtkHardwareSelector()
+        self._face_tree: cKDTree | None = None
+        self._face_normals = np.zeros((0, 3), dtype=np.float64)
         self._cell_locator = None
         self._last_screen_position: tuple[float, float] | None = None
         self._mesh_actor = None
@@ -161,78 +161,91 @@ class MainWindow(QMainWindow):
         return np.asarray(renderer.GetDisplayPoint(), dtype=np.float64)
 
     def _pick_and_paint(self, x: int, y: int) -> None:
-        if self.source is None or self._mesh_actor is None or self._display_mesh is None:
+        if self.source is None or self._mesh_actor is None or self._face_tree is None:
             return
+
         renderer = self.plotter.renderer
-        if not self._picker.Pick(x, y, 0, renderer):
-            return
-        cell_id = int(self._picker.GetCellId())
-        if cell_id < 0:
-            return
-
-        pick_position = np.asarray(self._picker.GetPickPosition(), dtype=np.float64)
-        camera = renderer.GetActiveCamera()
-        direction = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
-        view_up = np.asarray(camera.GetViewUp(), dtype=np.float64)
-        right = np.cross(direction, view_up)
-        right_norm = float(np.linalg.norm(right))
-        up_norm = float(np.linalg.norm(view_up))
-        if right_norm == 0.0 or up_norm == 0.0:
-            self.paint_at(cell_id)
-            return
-        right /= right_norm
-        view_up /= up_norm
-
-        center_display = self._world_to_display(renderer, pick_position)
-        right_display = self._world_to_display(renderer, pick_position + right * self.brush_radius)
-        up_display = self._world_to_display(renderer, pick_position + view_up * self.brush_radius)
-        radius_px = max(
-            float(np.linalg.norm(right_display[:2] - center_display[:2])),
-            float(np.linalg.norm(up_display[:2] - center_display[:2])),
-        )
         width, height = renderer.GetSize()
-        radius_px = max(1, int(np.ceil(radius_px)))
-        area = (
-            max(0, x - radius_px),
-            max(0, y - radius_px),
-            min(width - 1, x + radius_px),
-            min(height - 1, y + radius_px),
-        )
+        current = (int(x), int(y))
+        previous = self._last_screen_position
+        self._last_screen_position = current
 
-        # One GPU hardware-selection pass replaces hundreds of CPU-side
-        # point picks along a single mouse movement.
-        selector = self._hardware_selector
-        selector.SetRenderer(renderer)
-        selector.SetFieldAssociation(vtkDataObject.FIELD_ASSOCIATION_CELLS)
-        selector.SetArea(*area)
-        selection = selector.Select()
-        selected_ids: list[np.ndarray] = []
-        if selection is not None:
-            prop_key = vtkSelectionNode.PROP()
-            for node_index in range(selection.GetNumberOfNodes()):
-                node = selection.GetNode(node_index)
-                if node.GetProperties().Get(prop_key) != self._mesh_actor:
-                    continue
-                vtk_ids = node.GetSelectionList()
-                if vtk_ids is not None and vtk_ids.GetNumberOfTuples():
-                    selected_ids.append(
-                        np.fromiter(
-                            (vtk_ids.GetValue(i) for i in range(vtk_ids.GetNumberOfTuples())),
-                            dtype=np.intp,
-                        )
-                    )
+        # Pick at a spacing related to the brush diameter, not every 2 pixels.
+        # This keeps fast strokes continuous without triggering a GPU selection
+        # render pass for every mouse event.
+        if previous is None:
+            samples = [current]
+        else:
+            dx = current[0] - previous[0]
+            dy = current[1] - previous[1]
+            distance = float(np.hypot(dx, dy))
+            step_px = max(5.0, min(18.0, self._brush_radius_pixels(x, y) * 0.45))
+            count = max(1, int(np.ceil(distance / step_px)))
+            samples = [
+                (
+                    int(round(previous[0] + dx * index / count)),
+                    int(round(previous[1] + dy * index / count)),
+                )
+                for index in range(1, count + 1)
+            ]
 
-        if not selected_ids:
-            self.paint_at(cell_id)
+        hit_points: list[np.ndarray] = []
+        hit_normals: list[np.ndarray] = []
+        for sample_x, sample_y in samples:
+            if not self._picker.Pick(sample_x, height - sample_y, 0, renderer):
+                continue
+            cell_id = int(self._picker.GetCellId())
+            if cell_id < 0 or cell_id >= self.source.face_count:
+                continue
+            hit_points.append(np.asarray(self._picker.GetPickPosition(), dtype=np.float64))
+            hit_normals.append(self._face_normals[cell_id])
+
+        if not hit_points:
             return
-        affected = np.unique(np.concatenate(selected_ids))
-        affected = affected[(affected >= 0) & (affected < self.source.face_count)]
-        if affected.size:
-            offsets = self.source.face_centers[affected] - pick_position
-            inside_brush = np.einsum("ij,ij->i", offsets, offsets) <= self.brush_radius**2
-            affected = affected[inside_brush]
-        if affected.size:
-            self.paint_at(affected)
+
+        # One vectorized spatial query handles all interpolated samples in this
+        # mouse event. Oppositely oriented faces are rejected so a nearby back
+        # wall is not painted through a thin shell.
+        groups = self._face_tree.query_ball_point(
+            np.asarray(hit_points, dtype=np.float64),
+            r=self.brush_radius,
+            return_sorted=False,
+        )
+        selected: list[np.ndarray] = []
+        for ids, hit_normal in zip(groups, hit_normals, strict=True):
+            if not ids:
+                continue
+            face_ids = np.asarray(ids, dtype=np.intp)
+            same_side = self._face_normals[face_ids] @ hit_normal >= 0.0
+            face_ids = face_ids[same_side]
+            if face_ids.size:
+                selected.append(face_ids)
+
+        if selected:
+            self.paint_at(np.unique(np.concatenate(selected)))
+
+    def _brush_radius_pixels(self, x: int, y: int) -> float:
+        if self._picker.Pick(x, self.plotter.interactor.height() - y, 0, self.plotter.renderer):
+            point = np.asarray(self._picker.GetPickPosition(), dtype=np.float64)
+            renderer = self.plotter.renderer
+            camera = renderer.GetActiveCamera()
+            direction = np.asarray(camera.GetDirectionOfProjection(), dtype=np.float64)
+            view_up = np.asarray(camera.GetViewUp(), dtype=np.float64)
+            right = np.cross(direction, view_up)
+            right_norm = float(np.linalg.norm(right))
+            up_norm = float(np.linalg.norm(view_up))
+            if right_norm > 0.0 and up_norm > 0.0:
+                right /= right_norm
+                view_up /= up_norm
+                center = self._world_to_display(renderer, point)
+                right_point = self._world_to_display(renderer, point + right * self.brush_radius)
+                up_point = self._world_to_display(renderer, point + view_up * self.brush_radius)
+                return max(
+                    1.0,
+                    float(np.linalg.norm(right_point[:2] - center[:2])),
+                    float(np.linalg.norm(up_point[:2] - center[:2])),
+                )
+        return 12.0
 
     def set_active_label(self, label: Label) -> None:
         self.active_label = label
@@ -268,6 +281,13 @@ class MainWindow(QMainWindow):
             self.source = load_stl(path)
             self.labels = np.zeros(self.source.face_count, dtype=np.uint8)
             self._stroke_marks = np.zeros(self.source.face_count, dtype=np.uint32)
+            self._face_tree = cKDTree(self.source.face_centers, compact_nodes=True, balanced_tree=True)
+            faces = np.asarray(self.source.mesh.faces, dtype=np.int64).reshape(-1, 4)[:, 1:]
+            triangles = np.asarray(self.source.mesh.points, dtype=np.float64)[faces]
+            normals = np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0])
+            lengths = np.linalg.norm(normals, axis=1)
+            lengths[lengths == 0.0] = 1.0
+            self._face_normals = normals / lengths[:, None]
             self._stroke_id = 0
             self._render_mesh()
             self._update_info()
