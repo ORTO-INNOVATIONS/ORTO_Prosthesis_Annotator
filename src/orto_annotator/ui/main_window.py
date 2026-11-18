@@ -250,6 +250,11 @@ class MainWindow(QMainWindow):
         normals.Update()
         self._display_mesh = pv.wrap(normals.GetOutput())
         self._display_mesh.GetPointData().SetActiveNormals("Normals")
+        self._picker.RemoveAllLocators()
+        self._cell_locator = pv._vtk.vtkStaticCellLocator()
+        self._cell_locator.SetDataSet(self._display_mesh)
+        self._cell_locator.BuildLocator()
+        self._picker.AddLocator(self._cell_locator)
         self._display_rgb = np.asarray(
             [
                 tuple(round(channel * 255) for channel in LABEL_COLORS[Label(int(value))])
