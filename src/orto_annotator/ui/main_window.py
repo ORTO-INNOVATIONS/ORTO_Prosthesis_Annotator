@@ -29,7 +29,7 @@ from orto_annotator.core.project import load_project, save_project
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.4 TEST")
+        self.setWindowTitle("ORTO Prosthesis Annotator 0.2.5 TEST")
         self.resize(1440, 900)
         self.source: SourceMesh | None = None
         self.labels = np.zeros(0, dtype=np.uint8)
@@ -216,15 +216,22 @@ class MainWindow(QMainWindow):
 
         groups = self._face_tree.query_ball_point(np.asarray(hit_points, dtype=np.float64), r=self.brush_radius, return_sorted=False)
         selected: list[np.ndarray] = []
+        stroke_marks = self._stroke_marks
+        stroke_id = self._stroke_id
         for ids, hit_normal in zip(groups, hit_normals, strict=True):
             if not ids:
                 continue
             face_ids = np.asarray(ids, dtype=np.intp)
             face_ids = face_ids[self._face_normals[face_ids] @ hit_normal >= 0.0]
+            if self._left_button_down and face_ids.size:
+                # Deduplicate brush centres in O(n), without sorting large arrays.
+                fresh = stroke_marks[face_ids] != stroke_id
+                face_ids = face_ids[fresh]
+                stroke_marks[face_ids] = stroke_id
             if face_ids.size:
                 selected.append(face_ids)
         if selected:
-            self.paint_at(np.unique(np.concatenate(selected)))
+            self.paint_at(np.concatenate(selected), already_stamped=True)
 
     def _update_brush_cursor(self, x: int, y: int) -> None:
         if self.source is None or self._mesh_actor is None:
@@ -421,7 +428,7 @@ class MainWindow(QMainWindow):
         self.plotter.reset_camera()
         self.plotter.render()
 
-    def paint_at(self, cell_ids: int | np.ndarray) -> None:
+    def paint_at(self, cell_ids: int | np.ndarray, already_stamped: bool = False) -> None:
         if (
             self.source is None
             or self._display_mesh is None
@@ -432,13 +439,14 @@ class MainWindow(QMainWindow):
         affected = affected[(affected >= 0) & (affected < self.source.face_count)]
         if affected.size == 0:
             return
-        affected = np.unique(affected)
-        if self._left_button_down:
-            fresh = self._stroke_marks[affected] != self._stroke_id
-            affected = affected[fresh]
-            if affected.size == 0:
-                return
-            self._stroke_marks[affected] = self._stroke_id
+        if not already_stamped:
+            affected = np.unique(affected)
+            if self._left_button_down:
+                fresh = self._stroke_marks[affected] != self._stroke_id
+                affected = affected[fresh]
+                if affected.size == 0:
+                    return
+                self._stroke_marks[affected] = self._stroke_id
         new_value = int(self.active_label)
         changed = affected[self.labels[affected] != new_value]
         if changed.size == 0:
