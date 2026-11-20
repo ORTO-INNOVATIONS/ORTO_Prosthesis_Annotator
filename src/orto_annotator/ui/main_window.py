@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pyvista as pv
-from scipy.spatial import cKDTree
 from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -19,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from pyvistaqt import QtInteractor
+from scipy.spatial import cKDTree
 
 from orto_annotator.core.export import export_dataset_item
 from orto_annotator.core.labels import LABEL_COLORS, LABEL_NAMES, Label
@@ -125,17 +125,16 @@ class MainWindow(QMainWindow):
             return super().eventFilter(watched, event)
 
         event_type = event.type()
-        if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
-            if self.paint_enabled:
-                self._left_button_down = True
-                self._last_painted_cell = -1
-                self._last_pick_position = None
-                self._last_screen_position = None
-                self._last_world_position = None
-                self._last_world_normal = None
-                self._stroke_id += 1
-                self._paint_from_mouse_event(event)
-                return True
+        if event_type == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton and self.paint_enabled:
+            self._left_button_down = True
+            self._last_painted_cell = -1
+            self._last_pick_position = None
+            self._last_screen_position = None
+            self._last_world_position = None
+            self._last_world_normal = None
+            self._stroke_id += 1
+            self._paint_from_mouse_event(event)
+            return True
 
         if event_type == QEvent.Type.MouseMove:
             if self.paint_enabled and self._left_button_down and event.buttons() & Qt.MouseButton.LeftButton:
@@ -145,16 +144,15 @@ class MainWindow(QMainWindow):
             if self.paint_enabled:
                 return True
 
-        if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
-            if self.paint_enabled:
-                self._left_button_down = False
-                self._last_painted_cell = -1
-                self._last_pick_position = None
-                self._last_screen_position = None
-                self._last_world_position = None
-                self._last_world_normal = None
-                self._update_info()
-                return True
+        if event_type == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton and self.paint_enabled:
+            self._left_button_down = False
+            self._last_painted_cell = -1
+            self._last_pick_position = None
+            self._last_screen_position = None
+            self._last_world_position = None
+            self._last_world_normal = None
+            self._update_info()
+            return True
 
         return super().eventFilter(watched, event)
 
